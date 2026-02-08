@@ -16,20 +16,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load the model globally
+# -----------------------------
+# Load Model
+# -----------------------------
 model_data = joblib.load('rf_weather_model.pkl')
 model = model_data["model"]
 
+# -----------------------------
+# Pydantic Models
+# -----------------------------
 class PredictionRequest(BaseModel):
     latitude: float
     longitude: float
     locationName: Optional[str] = None
 
-
 class WeatherData(BaseModel):
     date: str
-    temperature: float
-
+    temperature: float # Min Temp in Celsius
 
 class PredictionResponse(BaseModel):
     success: bool
@@ -38,19 +41,19 @@ class PredictionResponse(BaseModel):
     prediction: dict
     error: Optional[str] = None
 
-
 # -----------------------------
 # Helper Functions
 # -----------------------------
-def fetch_historical_weather(lat: float, lon: float) -> List[WeatherData]:
-    end_date = date.today()
-    start_date = end_date - timedelta(days=13)
-
+def fetch_weather_and_features(lat: float, lon: float):
+    # API defaults to Celsius and mm
     url = (
-        "https://archive-api.open-meteo.com/v1/archive?"
+        "https://api.open-meteo.com/v1/forecast?"
         f"latitude={lat}&longitude={lon}"
-        f"&start_date={start_date}&end_date={end_date}"
-        "&daily=temperature_2m_min&timezone=auto"
+        "&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,snowfall_sum"
+        "&hourly=snow_depth"
+        "&past_days=14"
+        "&forecast_days=0"
+        "&timezone=auto"
     )
 
     r = requests.get(url, timeout=10)
@@ -58,52 +61,34 @@ def fetch_historical_weather(lat: float, lon: float) -> List[WeatherData]:
         raise HTTPException(status_code=502, detail="Weather API failed")
 
     data = r.json()
+    daily = data.get("daily", {})
+    hourly = data.get("hourly", {})
 
-    if "daily" not in data:
-        raise HTTPException(status_code=500, detail="Invalid weather data")
+    all_features = []
+    display_history = []
 
-    weather = []
-    for i in range(len(data["daily"]["time"])):
-        weather.append(
-            WeatherData(
-                date=data["daily"]["time"][i],
-                temperature=data["daily"]["temperature_2m_min"][i],
-            )
+    for i in range(14):
+        # 1. Raw values for Model (Metric: °C, mm)
+        tmin_c = daily["temperature_2m_min"][i]
+        tmax_c = daily["temperature_2m_max"][i]
+        precip_mm = daily["precipitation_sum"][i]
+        snow_mm = daily["snowfall_sum"][i]
+        
+        # Calculate avg snow depth for the day (hourly is in cm)
+        day_start, day_end = i * 24, (i + 1) * 24
+        s_depth_avg = sum(hourly["snow_depth"][day_start:day_end]) / 24
+        
+        month = date.fromisoformat(daily["time"][i]).month
+
+        # Feature Order: min, max, precip, snow, depth, month
+        all_features.extend([tmin_c, tmax_c, precip_mm, snow_mm, s_depth_avg, month])
+
+        # 2. Display values for Frontend
+        display_history.append(
+            WeatherData(date=daily["time"][i], temperature=round(tmin_c, 1))
         )
 
-    return weather
-
-
-def reverse_geocode(lat: float, lon: float) -> str:
-    try:
-        url = f"https://nominatim.openstreetmap.org/reverse"
-        r = requests.get(
-            url,
-            params={"lat": lat, "lon": lon, "format": "json"},
-            headers={"User-Agent": "WeatherPredictionApp"},
-            timeout=5,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            address = data.get("address", {})
-            return ", ".join(
-                filter(None, [
-                    address.get("city"),
-                    address.get("town"),
-                    address.get("village"),
-                    address.get("country"),
-                ])
-            )
-    except Exception:
-        pass
-
-    return f"{lat:.2f}, {lon:.2f}"
-
-def model_predict(data: List[WeatherData]) -> float:
-    temperatures = np.array([d.temperature for d in data]).reshape(1, -1)
-    prediction = model.predict(temperatures)
-    return prediction[0]
-
+    return all_features, display_history
 
 # -----------------------------
 # API Endpoint
@@ -113,32 +98,28 @@ def predict_temperature(req: PredictionRequest):
     if not (-90 <= req.latitude <= 90 and -180 <= req.longitude <= 180):
         raise HTTPException(status_code=400, detail="Invalid coordinates")
 
-    historical = fetch_historical_weather(req.latitude, req.longitude)
+    feature_vector, historical_display = fetch_weather_and_features(req.latitude, req.longitude)
 
-    if len(historical) < 14:
-        raise HTTPException(status_code=400, detail="Insufficient historical data")
-    
-    prediction = model_predict(historical)
-    original = np.array([d.temperature for d in historical])
+    # Model Prediction (Result is in Celsius)
+    input_data = np.array([feature_vector]) 
+    prediction_c = model.predict(input_data)[0]
 
-
-    tomorrow = date.today() + timedelta(days=1)
-    location_name = req.locationName or reverse_geocode(req.latitude, req.longitude)
-
-    recent = original[-7:]
-    confidence = max(0.7, min(0.95, 1 - (recent.std() / 10)))
+    # Confidence calculation based on Celsius variance
+    recent_temps = np.array([d.temperature for d in historical_display[-7:]])
+    # A standard deviation of 10 in C is very high, so we use 15 for scaling
+    confidence = max(0.7, min(0.95, 1 - (recent_temps.std() / 15)))
 
     return {
         "success": True,
         "location": {
-            "name": location_name,
+            "name": req.locationName or f"{req.latitude}, {req.longitude}",
             "latitude": req.latitude,
             "longitude": req.longitude,
         },
-        "historicalData": historical,
+        "historicalData": historical_display,
         "prediction": {
-            "date": tomorrow.isoformat(),
-            "temperature": round(float(prediction), 1),
+            "date": (date.today() + timedelta(days=1)).isoformat(),
+            "temperature": round(float(prediction_c), 1), # Pure Celsius
             "confidence": round(confidence, 2),
         }
     }
